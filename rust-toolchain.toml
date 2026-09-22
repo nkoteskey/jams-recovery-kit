@@ -1,0 +1,5 @@
+# Pin so `cargo fmt --check` and `clippy -D warnings` are deterministic
+# across machines and CI. Bump deliberately, in lockstep with CI.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

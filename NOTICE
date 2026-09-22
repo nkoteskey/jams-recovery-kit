@@ -1,0 +1,8 @@
+jams-recovery-kit
+Copyright 2026 the jams-recovery-kit authors
+
+This product includes software developed as part of the jams-recovery-kit
+project. Licensed under the Apache License, Version 2.0; see LICENSE.
+
+Third-party crates are used under their own licenses (MIT, Apache-2.0,
+BSD-3-Clause, Unicode-3.0); run `cargo deny list` for the inventory.

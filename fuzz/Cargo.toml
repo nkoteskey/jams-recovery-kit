@@ -1,0 +1,47 @@
+# cargo-fuzz workspace. Deliberately its own workspace (the trailing
+# [workspace] table) so the root `cargo test --workspace` never sees the
+# nightly-only libfuzzer-sys dependency.
+#
+#     cargo +nightly fuzz run split_combine
+#     cargo +nightly fuzz run payload_decode
+#     cargo +nightly fuzz run sealed_material_decode
+[package]
+name = "recovery-kit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+sss-gf256 = { path = "../crates/sss-gf256" }
+jams-recovery-kit = { path = "../crates/jams-recovery-kit" }
+
+[[bin]]
+name = "split_combine"
+path = "fuzz_targets/split_combine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "payload_decode"
+path = "fuzz_targets/payload_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_material_decode"
+path = "fuzz_targets/sealed_material_decode.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]

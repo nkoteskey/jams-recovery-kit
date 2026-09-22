@@ -1,0 +1,4 @@
+Extracted from the upstream monorepo at commit 6803cbf07a929e0453d343700d26d1e912193198
+(origin/main, 2026-09-22): crates/jams-recovery-kit and the Shamir engine
+formerly inside a shared domain crate, split out here as crates/sss-gf256.
+Re-extraction: see oss-sync.sh in the staging parent directory.

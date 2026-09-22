@@ -1,0 +1,25 @@
+[package]
+name = "jams-recovery-kit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Guardian recovery kit: Shamir-splits an application identity (any type implementing RecoverableIdentity) into shares and reconstructs it on a fresh install, with an integrity check on the recovered material."
+keywords = ["shamir", "recovery", "identity", "backup"]
+categories = ["cryptography"]
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+sss-gf256 = { version = "0.1.0", path = "../sss-gf256" }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+base64 = "0.22"
+getrandom = "0.2"
+
+[lints]
+workspace = true

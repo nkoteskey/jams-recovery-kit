@@ -1,0 +1,22 @@
+[package]
+name = "sss-gf256"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shamir's Secret Sharing over GF(2^8) with a versioned, extensible recovery-kit payload. Confidentiality, not integrity — see the README."
+keywords = ["shamir", "secret-sharing", "recovery"]
+categories = ["cryptography"]
+publish = false
+
+[dependencies]
+base64 = "0.22"
+getrandom = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true
