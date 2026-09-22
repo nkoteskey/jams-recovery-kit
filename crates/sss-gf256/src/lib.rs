@@ -44,9 +44,6 @@ pub enum RecoveryError {
     /// `threshold` was 0 or larger than the share count.
     #[error("threshold must be between 1 and the share count")]
     BadThreshold,
-    /// The share count was outside `threshold..=255`.
-    #[error("share count must be between the threshold and 255")]
-    BadShareCount,
     /// The secret was empty.
     #[error("secret must be non-empty")]
     EmptySecret,
@@ -134,7 +131,7 @@ pub fn gf_inv(a: u8) -> u8 {
 }
 
 fn fill_random(buf: &mut [u8]) -> Result<(), RecoveryError> {
-    getrandom::getrandom(buf).map_err(|_| RecoveryError::RandomnessUnavailable)
+    getrandom::fill(buf).map_err(|_| RecoveryError::RandomnessUnavailable)
 }
 
 /// Split `secret` into `shares` shares, any `threshold` of which recover it.
@@ -146,11 +143,11 @@ pub fn split_secret(secret: &[u8], threshold: u8, shares: u8) -> Result<Vec<Shar
     if secret.is_empty() {
         return Err(RecoveryError::EmptySecret);
     }
+    // `shares` is a u8, so the 255-point limit of the field is enforced by
+    // the type; the only invalid inputs are an empty secret and a threshold
+    // outside `1..=shares`.
     if threshold < 1 || threshold > shares {
         return Err(RecoveryError::BadThreshold);
-    }
-    if shares < threshold {
-        return Err(RecoveryError::BadShareCount);
     }
 
     let degree = usize::from(threshold) - 1;
@@ -381,7 +378,7 @@ mod tests {
     #[test]
     fn large_random_secret_round_trips() {
         let mut secret = vec![0u8; 4096];
-        getrandom::getrandom(&mut secret).unwrap();
+        getrandom::fill(&mut secret).unwrap();
         let shares = split_secret(&secret, 3, 5).unwrap();
         let recovered = combine_shares(&[shares[4].clone(), shares[1].clone(), shares[2].clone()]).unwrap();
         assert_eq!(recovered.as_slice(), secret.as_slice());

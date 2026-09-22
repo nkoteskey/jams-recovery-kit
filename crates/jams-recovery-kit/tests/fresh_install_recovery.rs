@@ -20,7 +20,7 @@ struct FileIdentity {
 impl FileIdentity {
     fn generate() -> Self {
         let mut secret = vec![0u8; 48];
-        getrandom::getrandom(&mut secret).expect("os randomness");
+        getrandom::fill(&mut secret).expect("os randomness");
         Self { secret }
     }
 
@@ -68,7 +68,7 @@ impl RecoverableIdentity for FileIdentity {
 
 fn temp_dir(tag: &str) -> PathBuf {
     let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce).expect("os randomness");
+    getrandom::fill(&mut nonce).expect("os randomness");
     let dir = std::env::temp_dir().join(format!(
         "recovery-kit-test-{tag}-{:016x}",
         u64::from_be_bytes(nonce)
@@ -118,9 +118,14 @@ fn two_of_five_shares_recover_nothing_on_a_fresh_data_dir() {
     FileIdentity::wipe(&dir);
 
     let err = recover_identity::<FileIdentity>(&shares[..2], APP).unwrap_err();
+    // Two shares recombine to garbage: either the length prefix no longer
+    // fits (Decode) or it does and the digest fails (IntegrityCheckFailed).
     assert!(
-        matches!(err, jams_recovery_kit::Error::Kit(_)),
-        "expected a clean Kit(Corrupt) rejection, got {err:?}"
+        matches!(
+            err,
+            jams_recovery_kit::Error::Decode(_) | jams_recovery_kit::Error::IntegrityCheckFailed
+        ),
+        "expected the frame check to reject two shares, got {err:?}"
     );
     // Fails CLEANLY: nothing from the bad attempt was ever persisted.
     assert!(FileIdentity::load(&dir).is_none());

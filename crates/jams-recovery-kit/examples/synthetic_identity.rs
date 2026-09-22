@@ -17,7 +17,7 @@ struct SyntheticIdentity {
 impl SyntheticIdentity {
     fn generate() -> Result<Self, Box<dyn Error>> {
         let mut secret = vec![0u8; 32];
-        getrandom::getrandom(&mut secret).map_err(|e| e.to_string())?;
+        getrandom::fill(&mut secret).map_err(|e| e.to_string())?;
         Ok(Self { secret })
     }
 

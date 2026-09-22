@@ -27,13 +27,12 @@ fn encode_share_text(x: u8, y: &[u8]) -> String {
 
 #[test]
 fn realistically_shaped_kit_share_text_stays_within_budget() {
-    // ~9.5 KB of identity material (the size of a post-quantum signing +
-    // KEM keypair) and ~6.7 KB riding in an extension.
+    // ~9.5 KB of identity material and ~6.7 KB riding in an extension.
     let identity = BigIdentity(vec![0xA5; 9_500]);
     let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
     let mut extensions = BTreeMap::new();
     extensions.insert(
-        "extra_material_v1".to_string(),
+        "blob_a".to_string(),
         serde_json::json!({
             "first_b64": b64(&vec![0xAB_u8; 2_600]),
             "second_b64": b64(&vec![0xCD_u8; 2_500]),
@@ -42,7 +41,7 @@ fn realistically_shaped_kit_share_text_stays_within_budget() {
         }),
     );
     extensions.insert(
-        "provenance_v1".to_string(),
+        "blob_b".to_string(),
         serde_json::json!({"source_platform": "desktop", "source_app": "example-app"}),
     );
 
@@ -74,6 +73,6 @@ fn realistically_shaped_kit_share_text_stays_within_budget() {
 
     let recovered = recover_kit::<BigIdentity>(&shares[..3], "example-app").expect("recover");
     assert_eq!(recovered.identity.0, identity.0);
-    assert!(recovered.extensions.contains_key("extra_material_v1"));
-    assert!(recovered.extensions.contains_key("provenance_v1"));
+    assert!(recovered.extensions.contains_key("blob_a"));
+    assert!(recovered.extensions.contains_key("blob_b"));
 }

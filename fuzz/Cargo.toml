@@ -4,7 +4,7 @@
 #
 #     cargo +nightly fuzz run split_combine
 #     cargo +nightly fuzz run payload_decode
-#     cargo +nightly fuzz run sealed_material_decode
+#     cargo +nightly fuzz run framed_payload_decode
 [package]
 name = "recovery-kit-fuzz"
 version = "0.0.0"
@@ -35,8 +35,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "sealed_material_decode"
-path = "fuzz_targets/sealed_material_decode.rs"
+name = "framed_payload_decode"
+path = "fuzz_targets/framed_payload_decode.rs"
 test = false
 doc = false
 bench = false

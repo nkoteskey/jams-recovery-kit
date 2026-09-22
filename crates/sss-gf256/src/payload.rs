@@ -43,7 +43,8 @@ mod base64_bytes {
     use zeroize::Zeroizing;
 
     pub fn serialize<S: Serializer>(bytes: &Zeroizing<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()))
+        let text = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()));
+        s.serialize_str(&text)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Zeroizing<Vec<u8>>, D::Error> {
@@ -164,9 +165,12 @@ impl RecoveryKitPayload {
 
     /// Reconstruct a payload from `threshold`-or-more shares. Fewer than the
     /// threshold (or shares from a different split) recombine to bytes that
-    /// fail to decode — reported as [`RecoveryKitError::Corrupt`], never a
-    /// silent wrong-payload return. A payload that decodes but carries an
-    /// unsupported `kit_version` is rejected explicitly.
+    /// fail to decode — reported as [`RecoveryKitError::Corrupt`]. This is a
+    /// probabilistic check, not a proof: recombined garbage that happens to
+    /// be a well-formed payload document would decode. Callers that need a
+    /// stronger check use the digest-framed kit in `jams-recovery-kit`. A
+    /// payload that decodes but carries an unsupported `kit_version` is
+    /// rejected explicitly.
     pub fn recover(shares: &[Share]) -> Result<Self, RecoveryKitError> {
         let bytes = combine_shares(shares)?;
         Self::from_bytes(&bytes)
@@ -287,6 +291,45 @@ mod tests {
         ] {
             let _ = RecoveryKitPayload::from_bytes(bytes);
         }
+    }
+
+    #[test]
+    fn deeply_nested_extensions_are_rejected() {
+        // serde_json refuses documents nested deeper than its recursion
+        // limit (128) instead of overflowing the stack.
+        let nested = "[".repeat(200) + &"]".repeat(200);
+        let doc = format!(
+            "{{\"kit_version\":1,\"identity_key_material\":\"AA==\",\"created_at_unix\":0,\"extensions\":{{\"x\":{nested}}}}}"
+        );
+        assert_eq!(
+            RecoveryKitPayload::from_bytes(doc.as_bytes()).unwrap_err(),
+            RecoveryKitError::Corrupt
+        );
+    }
+
+    #[test]
+    fn non_canonical_base64_is_rejected() {
+        for bad in ["AA", "AA=", "AB==", "AAA=x", "A A =="] {
+            let doc =
+                format!("{{\"kit_version\":1,\"identity_key_material\":\"{bad}\",\"created_at_unix\":0}}");
+            assert_eq!(
+                RecoveryKitPayload::from_bytes(doc.as_bytes()).unwrap_err(),
+                RecoveryKitError::Corrupt,
+                "{bad:?} must be rejected"
+            );
+        }
+        let good = "{\"kit_version\":1,\"identity_key_material\":\"AA==\",\"created_at_unix\":0}";
+        assert!(RecoveryKitPayload::from_bytes(good.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn duplicate_fields_are_rejected() {
+        let doc =
+            "{\"kit_version\":1,\"kit_version\":1,\"identity_key_material\":\"AA==\",\"created_at_unix\":0}";
+        assert_eq!(
+            RecoveryKitPayload::from_bytes(doc.as_bytes()).unwrap_err(),
+            RecoveryKitError::Corrupt
+        );
     }
 
     #[test]

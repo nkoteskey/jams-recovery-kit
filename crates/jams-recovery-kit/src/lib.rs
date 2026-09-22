@@ -5,31 +5,36 @@
 //! long-lived secret (a signing keypair, a device key, a seed). This crate
 //! then:
 //!
-//! 1. exports that material, tags it with the application id, and seals it
-//!    with a SHA-256 digest into an opaque blob;
-//! 2. places the blob in a [`RecoveryKitPayload`] (with an optional display
-//!    label and an `extensions` map for anything else that should ride the
-//!    same kit) and Shamir-splits it into `n` shares, any `k` of which
-//!    reconstruct it;
-//! 3. on recovery, recombines the shares, rejects an unsupported payload
-//!    version, checks the application id, verifies the digest, and only
-//!    then hands the bytes to [`RecoverableIdentity::import_material`].
+//! 1. exports that material and tags it with the application id;
+//! 2. places it in a [`RecoveryKitPayload`] (with an optional display label
+//!    and an `extensions` map for anything else that should ride the same
+//!    kit), serializes the payload, and frames the WHOLE serialized payload
+//!    under one SHA-256 digest;
+//! 3. Shamir-splits the framed bytes into `n` shares, any `k` of which
+//!    reconstruct them;
+//! 4. on recovery, recombines the shares, verifies the digest over the
+//!    entire payload, decodes it, rejects an unsupported payload version,
+//!    checks the application id, and only then hands the material to
+//!    [`RecoverableIdentity::import_material`].
 //!
-//! # What the digest does and does not do
+//! # What the digest covers, and what it is not
 //!
-//! Shamir provides confidentiality, not authentication: fewer-than-threshold
-//! or mismatched shares recombine to *wrong* bytes rather than an error.
-//! The JSON envelope catches most of that by failing to decode; the digest
-//! catches the rest (a corrupted material blob that still decodes). What
-//! the digest does **not** do is authenticate the kit's origin: any party
-//! holding `k` shares can produce a payload with a valid digest. If you
-//! need origin authentication, verify the imported identity against
-//! something you already trust (a known public key, a fingerprint shown to
-//! the user) after `recover_kit` returns.
+//! The digest is computed over the complete serialized payload — the
+//! application id, the identity material, the display label, the creation
+//! time and every extension — with a fixed domain-separation prefix. A
+//! change to any of those after the kit was made fails recovery with
+//! [`Error::IntegrityCheckFailed`].
 //!
-//! Every buffer holding secret material is zeroized on drop.
-
-#![forbid(unsafe_code)]
+//! The digest is **unkeyed**. It detects corruption and mismatched share
+//! sets; it does not authenticate origin. Anyone who can hand you a share
+//! set can make one that verifies. If you need to know the recovered
+//! identity is the one you expect, compare it to something you already
+//! trust (a known public key, a fingerprint shown to the user) after
+//! `recover_kit` returns.
+//!
+//! Buffers holding secret material are zeroized on drop where this crate
+//! owns them; see the README for what that does and does not cover.
+#![doc = include_str!("../../../README.md")]
 
 use std::collections::BTreeMap;
 
@@ -71,8 +76,8 @@ pub enum Error {
     /// The material blob is larger than the framing allows.
     #[error("identity material too large ({0} bytes; limit is 4 GiB)")]
     MaterialTooLarge(usize),
-    /// The sealed material blob inside the payload was malformed.
-    #[error("decode identity material from kit: {0}")]
+    /// A framed blob inside the kit was malformed.
+    #[error("decode kit frame: {0}")]
     Decode(&'static str),
     /// The kit was made for a different application.
     #[error("kit was created for {found:?} but this application is {expected:?}")]
@@ -82,9 +87,9 @@ pub enum Error {
         /// Application id the caller expected.
         expected: String,
     },
-    /// The material's digest did not verify — corrupt shares slipped past
-    /// envelope decoding.
-    #[error("recovered material failed the integrity check — corrupt or mismatched shares")]
+    /// The digest over the whole payload did not verify — corrupt or
+    /// mismatched shares, or a payload edited after the kit was made.
+    #[error("recovered payload failed the integrity check — corrupt, mismatched, or edited shares")]
     IntegrityCheckFailed,
     /// The identity type rejected the recovered bytes.
     #[error("import identity: {0}")]
@@ -94,41 +99,79 @@ pub enum Error {
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-const DIGEST_DOMAIN: &[u8] = b"recovery-kit-material-v1";
+const DIGEST_DOMAIN: &[u8] = b"recovery-kit-payload-v1";
 const DIGEST_LEN: usize = 32;
 
-fn digest(app: &str, material: &[u8]) -> [u8; DIGEST_LEN] {
+fn digest(payload_bytes: &[u8]) -> [u8; DIGEST_LEN] {
     let mut h = Sha256::new();
     h.update(DIGEST_DOMAIN);
-    h.update((app.len() as u64).to_be_bytes());
-    h.update(app.as_bytes());
-    h.update((material.len() as u64).to_be_bytes());
-    h.update(material);
+    h.update((payload_bytes.len() as u64).to_be_bytes());
+    h.update(payload_bytes);
     h.finalize().into()
 }
 
-/// Sealed material framing (all integers big-endian):
+/// Outer frame, the bytes that are actually split (all integers big-endian):
 ///
 /// ```text
-/// u16 app_len | app (UTF-8) | u32 material_len | material | 32-byte SHA-256
+/// u32 payload_len | payload (JSON) | 32-byte SHA-256(domain || len || payload)
 /// ```
-fn seal(app: &str, material: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+fn frame(payload_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let len = u32::try_from(payload_bytes.len()).map_err(|_| Error::MaterialTooLarge(payload_bytes.len()))?;
+    let mut out = Zeroizing::new(Vec::with_capacity(4 + payload_bytes.len() + DIGEST_LEN));
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload_bytes);
+    out.extend_from_slice(&digest(payload_bytes));
+    Ok(out)
+}
+
+/// Inverse of [`frame`]: verifies the digest and returns the payload bytes.
+/// Never panics on malformed input.
+fn unframe(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let (len_bytes, rest) = bytes
+        .split_at_checked(4)
+        .ok_or(Error::Decode("truncated before payload length"))?;
+    let len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]);
+    let len = usize::try_from(len).map_err(|_| Error::Decode("payload length does not fit"))?;
+    let (payload, rest) = rest
+        .split_at_checked(len)
+        .ok_or(Error::Decode("truncated inside payload"))?;
+    let (found, rest) = rest
+        .split_at_checked(DIGEST_LEN)
+        .ok_or(Error::Decode("truncated inside digest"))?;
+    if !rest.is_empty() {
+        return Err(Error::Decode("trailing bytes after digest"));
+    }
+    let expected = digest(payload);
+    // The digest is over data the holder already possesses, so a
+    // constant-time comparison is not required; the fold simply avoids
+    // leaking the position of the first mismatch for no benefit.
+    let mismatch = found
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if mismatch != 0 {
+        return Err(Error::IntegrityCheckFailed);
+    }
+    Ok(Zeroizing::new(payload.to_vec()))
+}
+
+/// Inner frame carried in `identity_key_material`:
+///
+/// ```text
+/// u16 app_len | app (UTF-8) | u32 material_len | material
+/// ```
+fn seal_material(app: &str, material: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let app_len = u16::try_from(app.len()).map_err(|_| Error::AppIdTooLong(app.len()))?;
     let mat_len = u32::try_from(material.len()).map_err(|_| Error::MaterialTooLarge(material.len()))?;
-    let mut out = Zeroizing::new(Vec::with_capacity(
-        2 + app.len() + 4 + material.len() + DIGEST_LEN,
-    ));
+    let mut out = Zeroizing::new(Vec::with_capacity(2 + app.len() + 4 + material.len()));
     out.extend_from_slice(&app_len.to_be_bytes());
     out.extend_from_slice(app.as_bytes());
     out.extend_from_slice(&mat_len.to_be_bytes());
     out.extend_from_slice(material);
-    out.extend_from_slice(&digest(app, material));
     Ok(out)
 }
 
-/// Inverse of [`seal`]. Returns `(app, material)` after verifying the
-/// digest. Never panics on malformed input.
-fn unseal(bytes: &[u8]) -> Result<(String, Zeroizing<Vec<u8>>)> {
+fn unseal_material(bytes: &[u8]) -> Result<(String, Zeroizing<Vec<u8>>)> {
     let (app_len_bytes, rest) = bytes
         .split_at_checked(2)
         .ok_or(Error::Decode("truncated before app length"))?;
@@ -152,25 +195,25 @@ fn unseal(bytes: &[u8]) -> Result<(String, Zeroizing<Vec<u8>>)> {
     let (material, rest) = rest
         .split_at_checked(mat_len)
         .ok_or(Error::Decode("truncated inside material"))?;
-    let (found_digest, rest) = rest
-        .split_at_checked(DIGEST_LEN)
-        .ok_or(Error::Decode("truncated inside digest"))?;
     if !rest.is_empty() {
-        return Err(Error::Decode("trailing bytes after digest"));
+        return Err(Error::Decode("trailing bytes after material"));
     }
-    let material = Zeroizing::new(material.to_vec());
-    let expected = digest(&app, &material);
-    // Constant-time comparison is not required for a digest over data the
-    // holder already possesses, but there is no reason to leak the
-    // position of the first mismatch either.
-    let mismatch = found_digest
-        .iter()
-        .zip(expected.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    if mismatch != 0 {
-        return Err(Error::IntegrityCheckFailed);
-    }
-    Ok((app, material))
+    Ok((app, Zeroizing::new(material.to_vec())))
+}
+
+/// Build the payload for `identity`, frame it, and return the framed bytes.
+fn build_framed<I: RecoverableIdentity>(
+    identity: &I,
+    app_id: &str,
+    display_label: Option<String>,
+    extensions: BTreeMap<String, serde_json::Value>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let material = Zeroizing::new(identity.export_material());
+    let sealed = seal_material(app_id, &material)?;
+    let mut payload = RecoveryKitPayload::new(sealed.to_vec(), display_label);
+    payload.extensions = extensions;
+    let bytes = payload.to_bytes()?;
+    frame(&bytes)
 }
 
 /// Split `identity` into a guardian recovery kit for application `app_id`:
@@ -196,7 +239,7 @@ pub fn create_kit<I: RecoverableIdentity>(
 /// [`create_kit`], but with `extensions` set on the payload before
 /// splitting — the slot for riding additional secrets or metadata
 /// alongside the identity in the SAME kit, so a guardian holds one set of
-/// shares that recovers everything.
+/// shares that recovers everything. Extensions are covered by the digest.
 pub fn create_kit_with_extensions<I: RecoverableIdentity>(
     identity: &I,
     app_id: &str,
@@ -205,15 +248,15 @@ pub fn create_kit_with_extensions<I: RecoverableIdentity>(
     threshold: u8,
     total_shares: u8,
 ) -> Result<Vec<Share>> {
-    let material = Zeroizing::new(identity.export_material());
-    let sealed = seal(app_id, &material)?;
-    let mut payload = RecoveryKitPayload::new(sealed.to_vec(), display_label);
-    payload.extensions = extensions;
-    Ok(payload.split(threshold, total_shares)?)
+    let framed = build_framed(identity, app_id, display_label, extensions)?;
+    Ok(sss_gf256::split_secret(&framed, threshold, total_shares).map_err(RecoveryKitError::from)?)
 }
 
 /// Everything [`recover_kit`] reconstructs from a set of shares.
-#[derive(Debug)]
+///
+/// `Debug` is implemented by hand and never prints the identity: the
+/// identity type may hold secret material, and a `{:?}` in a log line is
+/// the classic way it leaks.
 pub struct RecoveredKit<I> {
     /// The rebuilt identity.
     pub identity: I,
@@ -225,18 +268,45 @@ pub struct RecoveredKit<I> {
     pub created_at_unix: u64,
 }
 
+impl<I> std::fmt::Debug for RecoveredKit<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredKit")
+            .field("identity", &format_args!("<{}>", std::any::type_name::<I>()))
+            .field("display_label", &self.display_label)
+            .field("extension_keys", &self.extensions.keys().collect::<Vec<_>>())
+            .field("created_at_unix", &self.created_at_unix)
+            .finish()
+    }
+}
+
+/// Decode a framed kit blob (verifying the whole-payload digest) into its
+/// payload without recovering shares — exposed for fuzzing and tooling.
+pub fn decode_framed_payload(bytes: &[u8]) -> Result<RecoveryKitPayload> {
+    let payload_bytes = unframe(bytes)?;
+    Ok(RecoveryKitPayload::from_bytes(&payload_bytes)?)
+}
+
 /// Reconstruct everything a kit carries from `threshold`-or-more shares
 /// produced by [`create_kit`]/[`create_kit_with_extensions`], WITHOUT
 /// persisting anything — callers that want a confirmation screen before
 /// committing use this, then persist once the user confirms.
 ///
-/// `expected_app` guards against loading the wrong application's kit —
-/// checked BEFORE the integrity check so the error names the actual
-/// mismatch.
+/// Order of checks: share shape → digest over the whole payload → payload
+/// decode and version → application id → identity import. Fewer than
+/// `threshold` shares (or shares from different kits) fail at the digest
+/// with [`Error::IntegrityCheckFailed`]; there is a roughly 2⁻²⁵⁶ chance
+/// that random bytes carry a valid digest, so "never a wrong payload" is
+/// probabilistic, not absolute.
 pub fn recover_kit<I: RecoverableIdentity>(shares: &[Share], expected_app: &str) -> Result<RecoveredKit<I>> {
-    let payload = RecoveryKitPayload::recover(shares)?;
-    let (found_app, material) = unseal_checked(&payload.identity_key_material, expected_app)?;
-    debug_assert_eq!(found_app, expected_app);
+    let combined = sss_gf256::combine_shares(shares).map_err(RecoveryKitError::from)?;
+    let payload = decode_framed_payload(&combined)?;
+    let (found_app, material) = unseal_material(&payload.identity_key_material)?;
+    if found_app != expected_app {
+        return Err(Error::WrongApp {
+            found: found_app,
+            expected: expected_app.to_owned(),
+        });
+    }
     let identity = I::import_material(&material).map_err(Error::Import)?;
     Ok(RecoveredKit {
         identity,
@@ -244,43 +314,6 @@ pub fn recover_kit<I: RecoverableIdentity>(shares: &[Share], expected_app: &str)
         extensions: payload.extensions.clone(),
         created_at_unix: payload.created_at_unix,
     })
-}
-
-/// Unseal, but report a wrong application id *before* the digest result,
-/// so pasting another application's kit produces the more useful error.
-fn unseal_checked(bytes: &[u8], expected_app: &str) -> Result<(String, Zeroizing<Vec<u8>>)> {
-    match unseal(bytes) {
-        Ok((app, material)) => {
-            if app != expected_app {
-                return Err(Error::WrongApp {
-                    found: app,
-                    expected: expected_app.to_owned(),
-                });
-            }
-            Ok((app, material))
-        }
-        Err(Error::IntegrityCheckFailed) => {
-            // The digest failed; still surface a wrong app id first if the
-            // framing itself was readable.
-            if let Some(app) = peek_app(bytes) {
-                if app != expected_app {
-                    return Err(Error::WrongApp {
-                        found: app,
-                        expected: expected_app.to_owned(),
-                    });
-                }
-            }
-            Err(Error::IntegrityCheckFailed)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn peek_app(bytes: &[u8]) -> Option<String> {
-    let (len_bytes, rest) = bytes.split_at_checked(2)?;
-    let len = usize::from(u16::from_be_bytes([len_bytes[0], len_bytes[1]]));
-    let (app, _) = rest.split_at_checked(len)?;
-    std::str::from_utf8(app).ok().map(str::to_owned)
 }
 
 /// [`recover_kit`], returning just the `(identity, display_label)` pair
@@ -293,18 +326,12 @@ pub fn recover_identity<I: RecoverableIdentity>(
     Ok((kit.identity, kit.display_label))
 }
 
-/// Decode a sealed material blob without recovering shares — exposed for
-/// fuzzing and tooling. Returns the application id and material.
-pub fn decode_sealed_material(bytes: &[u8]) -> Result<(String, Zeroizing<Vec<u8>>)> {
-    unseal(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A synthetic identity: a fixed-size random secret with a derived
-    /// "public" byte so tests can check the recovered secret matches.
+    /// fingerprint so tests can check the recovered secret matches.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct DemoIdentity {
         secret: Vec<u8>,
@@ -313,7 +340,7 @@ mod tests {
     impl DemoIdentity {
         fn generate() -> Self {
             let mut secret = vec![0u8; 64];
-            getrandom::getrandom(&mut secret).unwrap();
+            getrandom::fill(&mut secret).unwrap();
             Self { secret }
         }
         fn fingerprint(&self) -> u8 {
@@ -337,6 +364,25 @@ mod tests {
 
     const APP: &str = "example-app";
 
+    /// Build a kit whose payload JSON was edited AFTER framing (digest kept
+    /// from the original), split it, and hand the shares to `recover_kit`.
+    fn tampered_shares(edit: impl Fn(&mut serde_json::Value)) -> Vec<Share> {
+        let identity = DemoIdentity::generate();
+        let mut extensions = BTreeMap::new();
+        extensions.insert("blob_a".to_string(), serde_json::json!({"n": 1}));
+        let framed = build_framed(&identity, APP, Some("original".into()), extensions).unwrap();
+        // Split the frame back into payload + digest, edit the payload.
+        let len = u32::from_be_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        let mut value: serde_json::Value = serde_json::from_slice(&framed[4..4 + len]).unwrap();
+        edit(&mut value);
+        let edited = serde_json::to_vec(&value).unwrap();
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&u32::try_from(edited.len()).unwrap().to_be_bytes());
+        forged.extend_from_slice(&edited);
+        forged.extend_from_slice(&framed[4 + len..]); // the ORIGINAL digest
+        sss_gf256::split_secret(&forged, 2, 3).unwrap()
+    }
+
     #[test]
     fn split_then_any_3_of_5_recovers_the_same_identity() {
         let original = DemoIdentity::generate();
@@ -356,8 +402,8 @@ mod tests {
         let identity = DemoIdentity::generate();
         let mut extensions = BTreeMap::new();
         extensions.insert(
-            "extra_material_v1".to_string(),
-            serde_json::json!({"blob_b64": "AAECAw==", "note": null}),
+            "blob_a".to_string(),
+            serde_json::json!({"bytes_b64": "AAECAw==", "note": null}),
         );
         let shares = create_kit_with_extensions(&identity, APP, None, extensions.clone(), 3, 5).unwrap();
         let kit = recover_kit::<DemoIdentity>(&shares[..3], APP).unwrap();
@@ -380,8 +426,8 @@ mod tests {
         let shares = create_kit(&identity, APP, None, 3, 5).unwrap();
         let err = recover_identity::<DemoIdentity>(&shares[..2], APP).unwrap_err();
         assert!(
-            matches!(err, Error::Kit(RecoveryKitError::Corrupt)),
-            "got {err:?}"
+            matches!(err, Error::IntegrityCheckFailed | Error::Decode(_)),
+            "expected a clean rejection, got {err:?}"
         );
     }
 
@@ -400,25 +446,46 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_material_fails_the_integrity_check() {
-        let identity = DemoIdentity::generate();
-        let material = identity.export_material();
-        let mut sealed = seal(APP, &material).unwrap().to_vec();
-        // Flip one bit inside the material (not the framing, not the digest).
-        sealed[2 + APP.len() + 4 + 10] ^= 0x01;
-        let payload = RecoveryKitPayload::new(sealed, None);
-        let shares = payload.split(2, 3).unwrap();
-        let err = recover_identity::<DemoIdentity>(&shares[..2], APP).unwrap_err();
+    fn tampered_display_label_fails_the_integrity_check() {
+        let shares = tampered_shares(|v| v["display_label"] = serde_json::json!("edited"));
+        let err = recover_kit::<DemoIdentity>(&shares[..2], APP).unwrap_err();
+        assert!(matches!(err, Error::IntegrityCheckFailed), "got {err:?}");
+    }
+
+    #[test]
+    fn tampered_extensions_fail_the_integrity_check() {
+        let shares = tampered_shares(|v| v["extensions"]["blob_a"] = serde_json::json!({"n": 2}));
+        let err = recover_kit::<DemoIdentity>(&shares[..2], APP).unwrap_err();
+        assert!(matches!(err, Error::IntegrityCheckFailed), "got {err:?}");
+    }
+
+    #[test]
+    fn tampered_created_at_fails_the_integrity_check() {
+        let shares = tampered_shares(|v| v["created_at_unix"] = serde_json::json!(1));
+        let err = recover_kit::<DemoIdentity>(&shares[..2], APP).unwrap_err();
+        assert!(matches!(err, Error::IntegrityCheckFailed), "got {err:?}");
+    }
+
+    #[test]
+    fn tampered_material_fails_the_integrity_check() {
+        let shares = tampered_shares(|v| {
+            let s = v["identity_key_material"].as_str().unwrap().to_owned();
+            let mut chars: Vec<char> = s.chars().collect();
+            chars[8] = if chars[8] == 'A' { 'B' } else { 'A' };
+            v["identity_key_material"] = serde_json::json!(chars.into_iter().collect::<String>());
+        });
+        let err = recover_kit::<DemoIdentity>(&shares[..2], APP).unwrap_err();
         assert!(matches!(err, Error::IntegrityCheckFailed), "got {err:?}");
     }
 
     #[test]
     fn wrong_version_kit_is_rejected_through_this_crates_api() {
         let identity = DemoIdentity::generate();
-        let sealed = seal(APP, &identity.export_material()).unwrap();
+        let sealed = seal_material(APP, &identity.export_material()).unwrap();
         let mut payload = RecoveryKitPayload::new(sealed.to_vec(), None);
         payload.kit_version = CURRENT_KIT_VERSION + 1;
-        let shares = payload.split(3, 5).unwrap();
+        let framed = frame(&payload.to_bytes().unwrap()).unwrap();
+        let shares = sss_gf256::split_secret(&framed, 3, 5).unwrap();
         let err = recover_kit::<DemoIdentity>(&shares[..3], APP).unwrap_err();
         assert!(
             matches!(err, Error::Kit(RecoveryKitError::UnsupportedVersion { .. })),
@@ -428,7 +495,6 @@ mod tests {
 
     #[test]
     fn import_error_is_surfaced_not_swallowed() {
-        #[derive(Debug)]
         struct Picky;
         impl RecoverableIdentity for Picky {
             fn export_material(&self) -> Vec<u8> {
@@ -453,21 +519,44 @@ mod tests {
     }
 
     #[test]
-    fn sealed_material_decoder_never_panics() {
-        let good = seal(APP, b"material").unwrap();
+    fn framed_decoder_never_panics() {
+        let identity = DemoIdentity::generate();
+        let good = build_framed(&identity, APP, None, BTreeMap::new()).unwrap();
         for n in 0..good.len() {
-            let _ = decode_sealed_material(&good[..n]);
+            let _ = decode_framed_payload(&good[..n]);
         }
         let mut trailing = good.to_vec();
         trailing.push(0);
-        assert!(matches!(decode_sealed_material(&trailing), Err(Error::Decode(_))));
+        assert!(matches!(decode_framed_payload(&trailing), Err(Error::Decode(_))));
         assert!(matches!(
-            decode_sealed_material(&[0xff, 0xff]),
+            decode_framed_payload(&[0xff, 0xff, 0xff, 0xff]),
             Err(Error::Decode(_))
         ));
-        assert!(matches!(
-            decode_sealed_material(&[0, 1, 0xff]),
-            Err(Error::Decode(_))
-        ));
+        assert!(decode_framed_payload(&good).is_ok());
+    }
+
+    #[test]
+    fn inner_material_decoder_never_panics() {
+        let good = seal_material(APP, b"material").unwrap();
+        for n in 0..good.len() {
+            let _ = unseal_material(&good[..n]);
+        }
+        assert!(matches!(unseal_material(&[0xff, 0xff]), Err(Error::Decode(_))));
+        assert!(matches!(unseal_material(&[0, 1, 0xff]), Err(Error::Decode(_))));
+    }
+
+    #[test]
+    fn recovered_kit_debug_never_prints_the_identity() {
+        let identity = DemoIdentity::generate();
+        let shares = create_kit(&identity, APP, Some("label".into()), 1, 1).unwrap();
+        let kit = recover_kit::<DemoIdentity>(&shares, APP).unwrap();
+        let text = format!("{kit:?}");
+        assert!(text.contains("<jams_recovery_kit::tests::DemoIdentity>"));
+        assert!(text.contains("label"));
+        assert!(!text.contains("secret"));
+        // A printed byte vector would look like "[12, 34, ..."; the only
+        // brackets allowed are the (empty) extension-key list.
+        assert!(text.contains("extension_keys: []"));
+        assert_eq!(text.matches('[').count(), 1);
     }
 }
