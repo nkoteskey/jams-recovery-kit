@@ -70,7 +70,7 @@ jobs:
       - name: build every fuzz target and replay the seed corpus
         run: |
           cd fuzz
-          cargo fuzz build
+          cargo +nightly fuzz build
           for t in split_combine payload_decode framed_payload_decode; do
-            cargo fuzz run "$t" "corpus/$t" -- -runs=0
+            cargo +nightly fuzz run "$t" "corpus/$t" -- -runs=0
           done
